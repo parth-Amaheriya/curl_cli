@@ -1,6 +1,0 @@
-{
-  "name": "CURL_TRANSPILLER",
-  "description": "Professional cURL to Python transpiler with terminal aesthetics.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["AI-powered code generation"]
-}
