@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from typing import List
+from typing import List, Optional
 from app.config import settings
 from app.security import TokenData
 
@@ -16,7 +16,7 @@ from app.repositories.conversion_repo import save_conversion, get_user_conversio
 
 from app.security import (
     create_access_token, create_refresh_token, decode_token,
-    get_current_active_user, require_scope, security
+    get_current_active_user, require_scope, security, get_current_user_optional
 )
 from app.models import (
     UserRegister, UserLogin, UserResponse, Token, TokenRefresh,
@@ -196,15 +196,22 @@ async def get_me(
         scopes=user.scopes,
         created_at=user.created_at
     )
-# ============ PROTECTED CONVERSION ENDPOINTS ============
-@app.post("/api/v1/convert", response_model=ConversionResponse, tags=["Conversion"], dependencies=[Depends(require_scope("convert:curl"))])
+# ============ PUBLIC CONVERSION ENDPOINT ============
+@app.post("/api/v1/convert", response_model=ConversionResponse, tags=["Conversion"])
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
 async def convert(
     request: Request,
     convert_req: ConvertRequest,
-    current_user = Depends(get_current_active_user),
+    current_user: Optional[TokenData] = Depends(get_current_user_optional),
     db = Depends(get_db)
 ):
+    """
+    Converts a cURL command to a Python script.
+
+    - **Public Endpoint**: No authentication required for conversion.
+    - **Authenticated Users**: If a valid JWT is provided, the conversion will be saved to the user's history.
+    - **Rate Limited**: To prevent abuse, this endpoint is rate-limited.
+    """
     try:
         commands = convert_req.get_commands()
         result = convert_curls(
@@ -216,22 +223,24 @@ async def convert(
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Conversion failed"))
         
-        # Save to MongoDB
-        history_data = ConversionHistoryCreate(
-            user_id=current_user.user_id,
-            curl_command=commands[0]["curl"] if not convert_req.is_batch() else "; ".join([c.get("curl","") for c in commands]),
-            python_code=result.get("python_code"),
-            parser_code=result.get("parser_script"),
-            function_names=result.get("function_names", []),
-            status="success",
-            request_type="batch" if convert_req.is_batch() else "single"
-        )
-        await save_conversion(db, history_data)
+        # Save to history ONLY if the user is authenticated
+        if current_user:
+            history_data = ConversionHistoryCreate(
+                user_id=current_user.user_id,
+                curl_command=commands[0]["curl"] if not convert_req.is_batch() else "; ".join([c.get("curl","") for c in commands]),
+                python_code=result.get("python_code"),
+                parser_code=result.get("parser_script"),
+                function_names=result.get("function_names", []),
+                status="success",
+                request_type="batch" if convert_req.is_batch() else "single"
+            )
+            await save_conversion(db, history_data)
         
         if result.get("is_batch"):
             return ConversionResponse(success=True, request_script=result["request_script"], parser_script=result["parser_script"], function_names=result["function_names"])
         return ConversionResponse(success=True, python_code=result["python_code"], parser_code=result["parser_code"], function_name=result["function_name"])
-    except HTTPException: raise
+    except HTTPException: 
+        raise
     except Exception as e:
         logger.error(f"Conversion error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")

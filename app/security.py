@@ -138,6 +138,19 @@ async def get_current_user(
     return decode_token(credentials.credentials, token_type="access")
 
 
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[TokenData]:
+    """Dependency to get current user if authenticated, None otherwise"""
+    if credentials is None or credentials.credentials is None:
+        return None
+    
+    try:
+        return decode_token(credentials.credentials, token_type="access")
+    except HTTPException:
+        return None
+
+
 async def get_current_active_user(
     current_user: TokenData = Depends(get_current_user),
 ) -> TokenData:
