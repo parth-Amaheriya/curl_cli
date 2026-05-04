@@ -281,6 +281,25 @@ def build_request_arguments(spec: Dict[str, Any]) -> Tuple:
     return arguments, query_entries, payload_entries, payload_mode, payload_literal
 
 
+def normalize_proxy_config(proxy: Optional[Any]) -> Dict[str, str]:
+    """Return only enabled, non-empty proxy URLs."""
+    if not proxy:
+        return {}
+    if hasattr(proxy, "model_dump"):
+        proxy = proxy.model_dump()
+    if not isinstance(proxy, dict) or not proxy.get("enabled"):
+        return {}
+
+    proxies = {}
+    http_proxy = str(proxy.get("http") or "").strip()
+    https_proxy = str(proxy.get("https") or "").strip()
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
+    return proxies
+
+
 def render_request_function(spec: Dict[str, Any]) -> str:
     """Generate Python function code from spec"""
     args = []
@@ -326,9 +345,17 @@ def render_request_function(spec: Dict[str, Any]) -> str:
         lines.append(f"    payload = {render_template_expression(spec['data'])}")
 
     request_keyword = "json" if spec["payload_mode"] == "json" else "data"
+    proxies = spec.get("proxy") or {}
 
     lines.append("")
-    lines.append(f"    response = requests.request(method={spec['method']!r}, url=url, params=params, headers=headers, {request_keyword}=payload, impersonate='chrome')")
+    if proxies:
+        lines.append("    proxies = {")
+        for key, value in proxies.items():
+            lines.append(f"        {key!r}: {value!r},")
+        lines.append("    }")
+        lines.append("")
+    proxy_arg = ", proxies=proxies" if proxies else ""
+    lines.append(f"    response = requests.request(method={spec['method']!r}, url=url, params=params, headers=headers, {request_keyword}=payload{proxy_arg}, impersonate='chrome')")
     lines.append(f"    response.raise_for_status()")
     lines.append(f"")
     lines.append(f"    print(response)")
@@ -359,13 +386,14 @@ def render_main_function(request_specs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_request_specs_list(raw_input_list: list) -> list:
+def build_request_specs_list(raw_input_list: list, proxy: Optional[Any] = None) -> list:
     """Build request specs with unique function names
     
     Handles both dict and Pydantic model inputs for API compatibility.
     """
     specs = []
     used_names = set()
+    proxies = normalize_proxy_config(proxy)
     
     for entry in raw_input_list:
         # Handle both Pydantic models and dicts
@@ -405,6 +433,7 @@ def build_request_specs_list(raw_input_list: list) -> list:
         used_names.add(sanitized_fn)
 
         spec["name"] = sanitized_fn
+        spec["proxy"] = proxies
         args, queries, payloads, pmode, plit = build_request_arguments(spec)
         spec.update({
             "arguments": args,
@@ -417,9 +446,9 @@ def build_request_specs_list(raw_input_list: list) -> list:
     return specs
 
 
-def build_python_script(raw_input_list: List[Dict[str, str]]) -> Tuple[str, List[str]]:
+def build_python_script(raw_input_list: List[Dict[str, str]], proxy: Optional[Any] = None) -> Tuple[str, List[str]]:
     """Build complete Python script from curl commands"""
-    specs = build_request_specs_list(raw_input_list)
+    specs = build_request_specs_list(raw_input_list, proxy=proxy)
     code = [
         "import json",
         "import os",
@@ -450,12 +479,12 @@ def build_parser_py(function_names: List[str]) -> str:
         code.append(f"    return response.text\n")
     return "\n".join(code)
 
-def convert_single_curl(curl_command: str, function_name: Optional[str] = None) -> Dict[str, Any]:
+def convert_single_curl(curl_command: str, function_name: Optional[str] = None, proxy: Optional[Any] = None) -> Dict[str, Any]:
     """Convert single curl command - API entry point"""
     try:
         # Pass as list of dicts (not Pydantic models) to converter
         raw_input = [{"curl": curl_command, "function_name": function_name}]
-        script_code, function_names = build_python_script(raw_input)
+        script_code, function_names = build_python_script(raw_input, proxy=proxy)
         parser_code = build_parser_py(function_names)
         
         return {
@@ -464,7 +493,7 @@ def convert_single_curl(curl_command: str, function_name: Optional[str] = None) 
             "parser_code": parser_code,
             "function_name": function_names[0] if function_names else None,
             "metadata": {
-                "request_spec": build_request_specs_list(raw_input)[0]
+                "request_spec": build_request_specs_list(raw_input, proxy=proxy)[0]
             }
         }
     except Exception as e:
@@ -477,7 +506,7 @@ def convert_single_curl(curl_command: str, function_name: Optional[str] = None) 
         }
 
 
-def convert_batch_curls(commands: list) -> Dict[str, Any]:
+def convert_batch_curls(commands: list, proxy: Optional[Any] = None) -> Dict[str, Any]:
     """Convert multiple curl commands - API entry point
     
     Accepts list of dicts or Pydantic models.
@@ -493,7 +522,7 @@ def convert_batch_curls(commands: list) -> Dict[str, Any]:
             else:
                 raw_commands.append({'curl': str(cmd)})
         
-        script_code, function_names = build_python_script(raw_commands)
+        script_code, function_names = build_python_script(raw_commands, proxy=proxy)
         parser_code = build_parser_py(function_names)
         
         return {
@@ -517,7 +546,8 @@ def convert_batch_curls(commands: list) -> Dict[str, Any]:
 # ... [keep all existing helper functions: curl_to_requests, find_placeholders, etc.] ...
 def convert_curls(input_data: Union[str, Dict, List], 
                   function_name: Optional[str] = None,
-                  function_name_prefix: Optional[str] = None) -> Dict[str, Any]:
+                  function_name_prefix: Optional[str] = None,
+                  proxy: Optional[Any] = None) -> Dict[str, Any]:
     """
     Unified converter: handles single or batch curl commands
     
@@ -544,7 +574,7 @@ def convert_curls(input_data: Union[str, Dict, List],
                 else:
                     commands.append({"curl": str(cmd)})
             
-            script_code, function_names = build_python_script(commands)
+            script_code, function_names = build_python_script(commands, proxy=proxy)
             parser_code = build_parser_py(function_names)
             
             return {
@@ -572,7 +602,7 @@ def convert_curls(input_data: Union[str, Dict, List],
                 cmd_dict = {"curl": str(input_data), "function_name": function_name}
             
             raw_input = [cmd_dict]
-            script_code, function_names = build_python_script(raw_input)
+            script_code, function_names = build_python_script(raw_input, proxy=proxy)
             parser_code = build_parser_py(function_names)
             
             return {
@@ -582,7 +612,7 @@ def convert_curls(input_data: Union[str, Dict, List],
                 "function_name": function_names[0] if function_names else None,
                 "is_batch": False,
                 "metadata": {
-                    "request_spec": build_request_specs_list(raw_input)[0]
+                    "request_spec": build_request_specs_list(raw_input, proxy=proxy)[0]
                 }
             }
             

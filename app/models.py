@@ -88,10 +88,17 @@ class CurlRequest(BaseModel):
     curl: str = Field(..., description="The curl command to convert")
     function_name: Optional[str] = Field(None, pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+class ProxyConfig(BaseModel):
+    enabled: bool = False
+    http: str = ""
+    https: str = ""
+
 class ConvertRequest(BaseModel):
+    collection_name: Optional[str] = None
     curl: Optional[Union[str, CurlRequest]] = None
     commands: Optional[List[Union[str, CurlRequest]]] = Field(None, min_length=1, max_length=50)
     function_name_prefix: Optional[str] = None
+    proxy: Optional[ProxyConfig] = None
     
     @model_validator(mode='after')
     def validate_input(self):
@@ -132,6 +139,7 @@ class RunWorkspaceRequest(BaseModel):
     workspace_name: str
     request_code: str
     parser_code: str
+    proxy: Optional[ProxyConfig] = None
 
 class RunWorkspaceResponse(BaseModel):
     success: bool

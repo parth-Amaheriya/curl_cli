@@ -30,7 +30,7 @@ from app.models import (
     ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest,
     RunWorkspaceRequest, RunWorkspaceResponse
 )
-from app.converter import convert_curls
+from app.converter import convert_curls, normalize_proxy_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -110,6 +110,8 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
             error="Execution failed",
         )
 
+    proxy_json = json.dumps(normalize_proxy_config(payload.proxy))
+
     runner_code = textwrap.dedent(
         """
         import importlib.util
@@ -120,6 +122,7 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
 
         function_name = sys.argv[1]
         output_path = pathlib.Path(sys.argv[2])
+        proxy_config = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
         request_meta = {
             "status": None,
             "size": 0,
@@ -133,6 +136,8 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
             original_request = curl_requests.request
 
             def tracked_request(*args, **kwargs):
+                if proxy_config and not kwargs.get("proxies"):
+                    kwargs["proxies"] = proxy_config
                 response = original_request(*args, **kwargs)
                 request_meta["status"] = getattr(response, "status_code", None)
                 content_type = getattr(response, "headers", {}).get("content-type", "") or ""
@@ -231,7 +236,7 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
         result_path = tmp_path / "_result.json"
 
         completed = subprocess.run(
-            [sys.executable, "_runner.py", function_name, str(result_path)],
+            [sys.executable, "_runner.py", function_name, str(result_path), proxy_json],
             cwd=tmpdir,
             capture_output=True,
             text=True,
@@ -299,8 +304,8 @@ app = FastAPI(
     description="JWT-protected curl-to-python converter with MongoDB history",
     version=settings.app_version,
     lifespan=lifespan,  # ✅ Properly attached
-    docs_url="/docs" if settings.debug else None,
-    redoc_url="/redoc" if settings.debug else None,
+    docs_url="/curl2py_docs", 
+
 )
 
 app.state.limiter = limiter
@@ -457,7 +462,8 @@ async def convert(
         result = convert_curls(
             input_data=commands if convert_req.is_batch() else commands[0],
             function_name=convert_req.curl.function_name if not convert_req.is_batch() and isinstance(convert_req.curl, CurlRequest) else None,
-            function_name_prefix=convert_req.function_name_prefix
+            function_name_prefix=convert_req.function_name_prefix,
+            proxy=convert_req.proxy,
         )
         
         if not result.get("success"):
