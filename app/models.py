@@ -79,6 +79,14 @@ class ConversionHistoryCreate(BaseModel):
     status: str = "success"
     error_message: Optional[str] = None
     request_type: str = "single"
+    idempotency_key: Optional[str] = None
+    collection_id: Optional[str] = None
+    collection_name: Optional[str] = None
+    snippet_id: Optional[str] = None
+    snippet_name: Optional[str] = None
+    library: Optional[str] = None
+    proxy: Optional[Dict[str, Any]] = None
+    updated_at: Optional[datetime] = None
 
 class ConversionHistory(BaseModel):
     id: str = Field(alias="_id")
@@ -91,6 +99,14 @@ class ConversionHistory(BaseModel):
     error_message: Optional[str] = None
     request_type: str
     created_at: datetime
+    idempotency_key: Optional[str] = None
+    collection_id: Optional[str] = None
+    collection_name: Optional[str] = None
+    snippet_id: Optional[str] = None
+    snippet_name: Optional[str] = None
+    library: Optional[str] = None
+    proxy: Optional[Dict[str, Any]] = None
+    updated_at: Optional[datetime] = None
     
     @model_validator(mode='before')
     @classmethod
@@ -104,18 +120,25 @@ class ConversionHistory(BaseModel):
 class CurlRequest(BaseModel):
     curl: str = Field(..., description="The curl command to convert")
     function_name: Optional[str] = Field(None, pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    snippet_id: Optional[str] = None
+    name: Optional[str] = None
 
 class ProxyConfig(BaseModel):
     enabled: bool = False
-    http: str = ""
-    https: str = ""
+    url: str = ""
+    http: Optional[str] = None
+    https: Optional[str] = None
 
 class ConvertRequest(BaseModel):
+    collection_id: Optional[str] = None
     collection_name: Optional[str] = None
+    library: Optional[str] = None
     curl: Optional[Union[str, CurlRequest]] = None
     commands: Optional[List[Union[str, CurlRequest]]] = Field(None, min_length=1, max_length=50)
     function_name_prefix: Optional[str] = None
     proxy: Optional[ProxyConfig] = None
+    idempotency_key: Optional[str] = None
+    persist: bool = True
     
     @model_validator(mode='after')
     def validate_input(self):
@@ -180,6 +203,9 @@ class UserWorkspaceState(BaseModel):
     openResponseTabs: List[Dict[str, Any]] = []
     activeResponseTabId: Optional[str] = None
     updatedAt: Optional[datetime] = None
+
+class CollectionRenameRequest(BaseModel):
+    collection_name: str
 
 class HealthResponse(BaseModel):
     status: str

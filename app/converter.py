@@ -290,14 +290,13 @@ def normalize_proxy_config(proxy: Optional[Any]) -> Dict[str, str]:
     if not isinstance(proxy, dict) or not proxy.get("enabled"):
         return {}
 
-    proxies = {}
-    http_proxy = str(proxy.get("http") or "").strip()
-    https_proxy = str(proxy.get("https") or "").strip()
-    if http_proxy:
-        proxies["http"] = http_proxy
-    if https_proxy:
-        proxies["https"] = https_proxy
-    return proxies
+    proxy_url = str(proxy.get("url") or proxy.get("http") or proxy.get("https") or "").strip()
+    if not proxy_url:
+        return {}
+    return {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
 
 
 def render_request_function(spec: Dict[str, Any]) -> str:

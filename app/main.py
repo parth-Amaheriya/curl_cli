@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -32,7 +33,13 @@ from app.repositories.user_repo import (
     update_password_by_email,
     update_user_scopes,
 )
-from app.repositories.conversion_repo import save_conversion, get_user_conversions
+from app.repositories.conversion_repo import (
+    delete_conversion_collection,
+    delete_conversion_snippet,
+    get_user_conversions,
+    rename_conversion_collection,
+    save_conversion,
+)
 
 from app.security import (
     create_access_token, create_refresh_token, decode_token,
@@ -42,6 +49,7 @@ from app.models import (
     UserRegister, UserLogin, UserResponse, Token, TokenRefresh,
     ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest,
     ForgotPasswordRequest, GoogleLoginRequest, MessageResponse, ResetPasswordRequest,
+    CollectionRenameRequest,
     RunWorkspaceRequest, RunWorkspaceResponse, UserWorkspaceState
 )
 from app.converter import convert_curls, normalize_proxy_config
@@ -58,6 +66,16 @@ def _format_response_size(byte_count: int) -> str:
 def _response_file_name(workspace_name: str, extension: str) -> str:
     normalized = extension.lstrip(".")
     return f"{workspace_name}_response.{normalized}"
+
+
+def _persisted_proxy_config(proxy) -> dict:
+    if not proxy:
+        return {"enabled": False, "url": ""}
+    proxy_data = proxy.model_dump() if hasattr(proxy, "model_dump") else proxy
+    if not isinstance(proxy_data, dict) or not proxy_data.get("enabled"):
+        return {"enabled": False, "url": ""}
+    proxy_url = str(proxy_data.get("url") or proxy_data.get("http") or proxy_data.get("https") or "").strip()
+    return {"enabled": bool(proxy_url), "url": proxy_url}
 
 
 def _token_response_for_user(user) -> Token:
@@ -338,6 +356,21 @@ async def lifespan(app: FastAPI):
         await db.users.create_index("email", unique=True)
         await db.users.create_index("google_id", unique=True, sparse=True)
         await db.conversions.create_index([("user_id", 1), ("created_at", -1)])
+        try:
+            await db.conversions.drop_index("user_id_1_idempotency_key_1")
+        except OperationFailure:
+            pass
+        try:
+            await db.conversions.create_index(
+                [("user_id", 1), ("collection_id", 1), ("snippet_id", 1)],
+                unique=True,
+                partialFilterExpression={
+                    "collection_id": {"$exists": True},
+                    "snippet_id": {"$exists": True},
+                },
+            )
+        except (DuplicateKeyError, OperationFailure) as index_error:
+            logger.warning("Snippet conversion unique index was not created: %s", index_error)
         await db.user_projects.create_index("user_id", unique=True)
         await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
         logger.info("Database indexes created")
@@ -623,8 +656,12 @@ async def convert(
         if not result.get("success"):
             raise HTTPException(status_code=400, detail=result.get("error", "Conversion failed"))
         
-        # Save to history ONLY if the user is authenticated
-        if current_user:
+        if current_user and convert_req.persist:
+            primary_command = commands[0]
+            snippet_name = primary_command.get("function_name") or primary_command.get("name")
+            snippet_id = primary_command.get("snippet_id")
+            if not convert_req.collection_id or not snippet_id:
+                raise HTTPException(status_code=400, detail="Missing collection_id or snippet_id")
             history_data = ConversionHistoryCreate(
                 user_id=current_user.user_id,
                 curl_command=commands[0]["curl"] if not convert_req.is_batch() else "; ".join([c.get("curl","") for c in commands]),
@@ -632,7 +669,13 @@ async def convert(
                 parser_code=result.get("parser_script"),
                 function_names=result.get("function_names", []),
                 status="success",
-                request_type="batch" if convert_req.is_batch() else "single"
+                request_type="batch" if convert_req.is_batch() else "single",
+                collection_id=convert_req.collection_id,
+                collection_name=convert_req.collection_name,
+                snippet_id=snippet_id,
+                snippet_name=snippet_name,
+                library=convert_req.library,
+                proxy=_persisted_proxy_config(convert_req.proxy),
             )
             await save_conversion(db, history_data)
         
@@ -641,9 +684,14 @@ async def convert(
         return ConversionResponse(success=True, python_code=result["python_code"], parser_code=result["parser_code"], function_name=result["function_name"])
     except HTTPException: 
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DuplicateKeyError:
+        logger.error("Conversion save duplicate key error", exc_info=True)
+        raise HTTPException(status_code=409, detail="Could not save conversion. Please refresh and try again.")
     except Exception as e:
         logger.error(f"Conversion error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Conversion failed. Please try again.")
 
 @app.post("/run-workspace", response_model=RunWorkspaceResponse, tags=["Execution"])
 async def run_workspace(run_req: RunWorkspaceRequest):
@@ -705,6 +753,35 @@ async def delete_history(
     success = await delete_conversion(db, conv_id, current_user.user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Conversion not found or unauthorized")
+
+@app.delete("/api/v1/conversions/snippet/{collection_id}/{snippet_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["History"])
+async def delete_snippet_conversion(
+    request: Request,
+    collection_id: str,
+    snippet_id: str,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    await delete_conversion_snippet(db, current_user.user_id, collection_id, snippet_id)
+
+@app.delete("/api/v1/conversions/collection/{collection_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["History"])
+async def delete_collection_conversions(
+    request: Request,
+    collection_id: str,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    await delete_conversion_collection(db, current_user.user_id, collection_id)
+
+@app.patch("/api/v1/conversions/collection/{collection_id}/name", status_code=status.HTTP_204_NO_CONTENT, tags=["History"])
+async def rename_collection_conversions(
+    request: Request,
+    collection_id: str,
+    payload: CollectionRenameRequest,
+    current_user = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    await rename_conversion_collection(db, current_user.user_id, collection_id, payload.collection_name)
 
 # ============ PUBLIC ============
 @app.get("/health", tags=["Health"])
