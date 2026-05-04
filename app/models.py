@@ -23,6 +23,10 @@ class UserInDB(UserBase):
     created_at: datetime
     is_active: bool = True
     scopes: List[str] = []
+    provider: str = "password"
+    google_id: Optional[str] = None
+    avatar_url: Optional[str] = None
+    updated_at: Optional[datetime] = None
     
     @model_validator(mode='before')
     @classmethod
@@ -34,6 +38,16 @@ class UserInDB(UserBase):
 class UserLogin(BaseModel):
     username: str
     password: str
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str = Field(..., min_length=8)
 
 class UserResponse(BaseModel):
     id: str
@@ -50,6 +64,9 @@ class Token(BaseModel):
 
 class TokenRefresh(BaseModel):
     refresh_token: str
+
+class MessageResponse(BaseModel):
+    message: str
 
 
 # ============ CONVERSION HISTORY MODELS ============
@@ -155,6 +172,14 @@ class RunWorkspaceResponse(BaseModel):
     parsed: Optional[Any] = None
     logs: str = ""
     error: Optional[str] = None
+
+class UserWorkspaceState(BaseModel):
+    collections: Dict[str, Any] = {}
+    activeCollectionId: Optional[str] = None
+    theme: str = "dark"
+    openResponseTabs: List[Dict[str, Any]] = []
+    activeResponseTabId: Optional[str] = None
+    updatedAt: Optional[datetime] = None
 
 class HealthResponse(BaseModel):
     status: str

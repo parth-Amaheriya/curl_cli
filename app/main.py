@@ -1,12 +1,17 @@
 import logging
 import ast
+import hashlib
 import json
+import secrets
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +23,15 @@ from app.config import settings
 from app.security import TokenData
 
 from app.database import db, close_db, get_db
-from app.repositories.user_repo import create_user, authenticate_user, get_user_by_id, update_user_scopes
+from app.repositories.user_repo import (
+    authenticate_user,
+    create_or_update_google_user,
+    create_user,
+    get_user_by_email,
+    get_user_by_id,
+    update_password_by_email,
+    update_user_scopes,
+)
 from app.repositories.conversion_repo import save_conversion, get_user_conversions
 
 from app.security import (
@@ -28,7 +41,8 @@ from app.security import (
 from app.models import (
     UserRegister, UserLogin, UserResponse, Token, TokenRefresh,
     ConvertRequest, ConversionResponse, ConversionHistoryCreate, ConversionHistory, UserCreate, CurlRequest,
-    RunWorkspaceRequest, RunWorkspaceResponse
+    ForgotPasswordRequest, GoogleLoginRequest, MessageResponse, ResetPasswordRequest,
+    RunWorkspaceRequest, RunWorkspaceResponse, UserWorkspaceState
 )
 from app.converter import convert_curls, normalize_proxy_config
 
@@ -44,6 +58,44 @@ def _format_response_size(byte_count: int) -> str:
 def _response_file_name(workspace_name: str, extension: str) -> str:
     normalized = extension.lstrip(".")
     return f"{workspace_name}_response.{normalized}"
+
+
+def _token_response_for_user(user) -> Token:
+    token_data = {
+        "sub": user.id,
+        "username": user.username,
+        "email": user.email,
+        "scopes": user.scopes,
+    }
+    return Token(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+    )
+
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _verify_google_id_token(credential: str) -> dict:
+    if not settings.google_client_id:
+        raise HTTPException(status_code=500, detail="Google login is not configured")
+
+    query = urllib.parse.urlencode({"id_token": credential})
+    url = f"https://oauth2.googleapis.com/tokeninfo?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid Google credential") from exc
+
+    if payload.get("aud") != settings.google_client_id:
+        raise HTTPException(status_code=401, detail="Invalid Google audience")
+    if payload.get("email_verified") not in ("true", True):
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+    return payload
 
 
 def _find_request_function_name(request_code: str) -> Optional[str]:
@@ -274,28 +326,31 @@ def _run_workspace_code(payload: RunWorkspaceRequest) -> RunWorkspaceResponse:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 %s v%s starting...", settings.app_name, settings.app_version)
+    logger.info("%s v%s starting...", settings.app_name, settings.app_version)
     
     try:
         # 1. Ping MongoDB to verify connection
         await db.command("ping")
-        logger.info("✅ MongoDB connection successful")
+        logger.info("MongoDB connection successful")
         
         # 2. Create indexes for performance & uniqueness
         await db.users.create_index("username", unique=True)
         await db.users.create_index("email", unique=True)
+        await db.users.create_index("google_id", unique=True, sparse=True)
         await db.conversions.create_index([("user_id", 1), ("created_at", -1)])
-        logger.info("✅ Database indexes created")
+        await db.user_projects.create_index("user_id", unique=True)
+        await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
+        logger.info("Database indexes created")
         
     except Exception as e:
-        logger.error(f"❌ MongoDB startup failed: {e}")
+        logger.error(f" MongoDB startup failed: {e}")
         raise RuntimeError(f"Failed to connect to MongoDB: {e}") from e
         
     yield  # Server runs here
     
     # 3. Shutdown cleanup
     close_db()
-    logger.info("🛑 MongoDB client closed. Shutting down...")
+    logger.info("MongoDB client closed. Shutting down...")
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -303,7 +358,7 @@ app = FastAPI(
     title=settings.app_name,
     description="JWT-protected curl-to-python converter with MongoDB history",
     version=settings.app_version,
-    lifespan=lifespan,  # ✅ Properly attached
+    lifespan=lifespan,  # Properly attached
     docs_url="/curl2py_docs", 
 
 )
@@ -322,14 +377,14 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_cr
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
 async def register(
     request: Request, 
-    user_create: UserCreate,  # ✅ Renamed from 'user_' to 'user_create'
+    user_create: UserCreate,  # Renamed from 'user_' to 'user_create'
     db = Depends(get_db)
 ):
     """Register a new user account"""
     try:
-        # ✅ Use the correct variable name
+        # Use the correct variable name
         user = await create_user(db, user_create)
-        logger.info(f"✅ New user registered: {user.username}")
+        logger.info(f"New user registered: {user.username}")
         return UserResponse(
             id=user.id,
             username=user.username,
@@ -348,7 +403,7 @@ async def register(
 @limiter.limit(f"{settings.rate_limit_per_minute * 2}/minute")
 async def login(
     request: Request, 
-    credentials: UserLogin,  # ✅ Clear variable name
+    credentials: UserLogin,  #  Clear variable name
     db = Depends(get_db)
 ):
     """Login and receive JWT tokens"""
@@ -372,7 +427,7 @@ async def login(
     access_token = create_access_token(token_data)
     refresh_token = create_refresh_token(token_data)
     
-    logger.info(f"🔐 User logged in: {user.username}")
+    logger.info(f" User logged in: {user.username}")
     
     return Token(
         access_token=access_token,
@@ -381,11 +436,68 @@ async def login(
     )
 
 
+@app.post("/api/v1/auth/google", response_model=Token, tags=["Authentication"])
+async def google_login(
+    payload: GoogleLoginRequest,
+    db = Depends(get_db)
+):
+    google_payload = _verify_google_id_token(payload.credential)
+    user = await create_or_update_google_user(
+        db,
+        email=google_payload["email"],
+        name=google_payload.get("name") or google_payload["email"].split("@")[0],
+        google_id=google_payload["sub"],
+        avatar_url=google_payload.get("picture"),
+    )
+    return _token_response_for_user(user)
+
+
+@app.post("/api/v1/auth/forgot-password", response_model=MessageResponse, tags=["Authentication"])
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db = Depends(get_db)
+):
+    user = await get_user_by_email(db, payload.email)
+    if user:
+        token = secrets.token_urlsafe(32)
+        await db.password_resets.insert_one({
+            "user_id": user.id,
+            "email": payload.email,
+            "token_hash": _hash_reset_token(token),
+            "expires_at": datetime.now(timezone.utc) + timedelta(hours=2),
+            "used_at": None,
+            "created_at": datetime.now(timezone.utc),
+        })
+        logger.info("Password reset requested for %s", payload.email)
+    return MessageResponse(message="If an account exists for that email, password reset instructions will be sent.")
+
+
+@app.post("/api/v1/auth/reset-password", response_model=MessageResponse, tags=["Authentication"])
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db = Depends(get_db)
+):
+    reset_doc = await db.password_resets.find_one({
+        "token_hash": _hash_reset_token(payload.token),
+        "used_at": None,
+        "expires_at": {"$gt": datetime.now(timezone.utc)},
+    })
+    if not reset_doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    await update_password_by_email(db, reset_doc["email"], payload.password)
+    await db.password_resets.update_one(
+        {"_id": reset_doc["_id"]},
+        {"$set": {"used_at": datetime.now(timezone.utc)}}
+    )
+    return MessageResponse(message="Password has been reset.")
+
+
 @app.post("/api/v1/auth/refresh", response_model=Token, tags=["Authentication"])
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
-async def refresh_token_endpoint(  # ✅ Renamed to avoid conflict with function
+async def refresh_token_endpoint(  # Renamed to avoid conflict with function
     request: Request, 
-    token_request: TokenRefresh,  # ✅ Clear variable name
+    token_request: TokenRefresh,  # Clear variable name
     db = Depends(get_db)
 ):
     """Refresh access token using refresh token"""
@@ -441,6 +553,48 @@ async def get_me(
         scopes=user.scopes,
         created_at=user.created_at
     )
+
+
+@app.get("/api/v1/workspace", response_model=UserWorkspaceState, tags=["Workspace"])
+async def get_workspace_state(
+    current_user: TokenData = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    doc = await db.user_projects.find_one({"user_id": current_user.user_id})
+    if not doc:
+        return UserWorkspaceState(collections={}, activeCollectionId=None, theme="dark")
+    return UserWorkspaceState(
+        collections=doc.get("collections") or {},
+        activeCollectionId=doc.get("activeCollectionId"),
+        theme=doc.get("theme") or "dark",
+        openResponseTabs=doc.get("openResponseTabs") or [],
+        activeResponseTabId=doc.get("activeResponseTabId"),
+        updatedAt=doc.get("updated_at"),
+    )
+
+
+@app.put("/api/v1/workspace", response_model=UserWorkspaceState, tags=["Workspace"])
+async def save_workspace_state(
+    workspace: UserWorkspaceState,
+    current_user: TokenData = Depends(get_current_active_user),
+    db = Depends(get_db)
+):
+    now = datetime.now(timezone.utc)
+    doc = {
+        "user_id": current_user.user_id,
+        "collections": workspace.collections,
+        "activeCollectionId": workspace.activeCollectionId,
+        "theme": workspace.theme,
+        "openResponseTabs": workspace.openResponseTabs,
+        "activeResponseTabId": workspace.activeResponseTabId,
+        "updated_at": now,
+    }
+    await db.user_projects.update_one(
+        {"user_id": current_user.user_id},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return UserWorkspaceState(**{**workspace.model_dump(), "updatedAt": now})
 # ============ PUBLIC CONVERSION ENDPOINT ============
 @app.post("/api/v1/convert", response_model=ConversionResponse, tags=["Conversion"])
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")

@@ -43,7 +43,7 @@ class UserInDB(UserBase):
 
 
 # ============ IN-MEMORY STORAGE ============
-# ⚠️ REPLACE WITH POSTGRESQL/MONGODB IN PRODUCTION
+# Replace with PostgreSQL/MongoDB in production.
 _users_db: dict[str, UserInDB] = {}
 _username_index: dict[str, str] = {}
 _email_index: dict[str, str] = {}
@@ -134,16 +134,16 @@ def initialize_db():
             create_user(UserCreate(
                 username="admin",
                 email="admin@example.com",
-                password="admin123"  # 🔒 CHANGE IN PRODUCTION!
+                password="admin123"  # Change in production.
             ))
             admin = get_user_by_username("admin")
             if admin:
                 update_user_scopes(admin.id, ["convert:curl", "admin:all"])
-            print("✅ Created test admin user: admin / admin123")
+            print("Created test admin user: admin / admin123")
         except ValueError as e:
-            print(f"⚠️ Could not create admin: {e}")
+            print(f"Could not create admin: {e}")
     else:
-        print("✅ Database already initialized")
+        print("Database already initialized")
 
 
 async def get_db():

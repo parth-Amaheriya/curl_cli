@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # Security
     bcrypt_rounds: int = 12
+    google_client_id: str = ""
+    frontend_url: str = "http://localhost:5173"
 
     # CORS (important fix: must be typed correctly)
     cors_origins: List[str] = ["*"]
